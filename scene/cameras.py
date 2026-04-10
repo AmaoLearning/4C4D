@@ -63,7 +63,7 @@ class Camera:
         self.trans = trans
         self.scale = scale
 
-        self.world_view_transform = torch.from_numpy(getWorld2View2(R, T, trans, scale)).transpose(0, 1)
+        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1)
         if cx > 0:
             self.projection_matrix = getProjectionMatrixCenterShift(self.znear, self.zfar, cx, cy, fl_x, fl_y, self.image_width, self.image_height).transpose(0,1)
         else:

@@ -15,7 +15,7 @@ from torch import nn
 from tqdm import tqdm
 from torch.autograd import Variable
 from math import exp
-from torchmetrics import MultiScaleStructuralSimilarityIndexMeasure
+from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
 import math
 
 def l1_loss(network_output, gt):

@@ -59,6 +59,14 @@ class ModelParams(ParamGroup):
         self.loaded_pth = ""
         self.frame_ratio = 1
         self.dataloader = False
+        self.num_images = 300
+        self.dynerf_hold_id = 0
+        # ── Lazy loading & double-buffer GPU image pool ──
+        self.lazy_load = False
+        self.load2gpu_on_the_fly = False
+        self.lazy_num_workers = 16
+        self.lazy_prefetch_factor = 12
+        self.lazy_image_buffer_count = 128
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

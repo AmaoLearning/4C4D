@@ -28,6 +28,7 @@ from multiprocessing.pool import ThreadPool
 import imagesize
 from collections import defaultdict
 
+from glob import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
@@ -532,7 +533,185 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", num_pt
                            ply_path=ply_path)
     return scene_info
 
+
+# ── Dynerf / N3V (Neural 3D Video) dataset reader ────────────────────
+
+
+def readCamerasFromDynerf(
+    path: str,
+    npy_file: str,
+    split: str,
+    hold_id: list,
+    num_images: int,
+    dataloader: bool = False,
+) -> list:
+    """Read cameras from poses_bounds.npy for N3V/Dynerf datasets.
+
+    Camera parameters are extracted identically to the LLFF / Neural3D
+    convention used in 4DGS.  Each ``cam*/images/`` directory provides
+    the per-frame images.
+
+    Args:
+        path: Root dataset directory (contains cam*/ and poses_bounds.npy).
+        npy_file: Name of the npy file (usually ``poses_bounds.npy``).
+        split: ``"train"`` or ``"test"``.
+        hold_id: List of camera indices reserved for testing.
+        num_images: Max number of temporal frames per camera.
+        dataloader: If True, skip image loading (meta_only mode).
+    """
+    cam_infos: list = []
+    video_paths = sorted(glob(os.path.join(path, 'cam*')))
+    poses_bounds = np.load(os.path.join(path, npy_file))
+
+    poses = poses_bounds[:, :15].reshape(-1, 3, 5)
+    H_raw, W_raw, focal_raw = poses[0, :, -1]
+
+    n_cameras = poses.shape[0]
+    assert len(video_paths) == n_cameras, (
+        f"Camera count mismatch: {len(video_paths)} dirs vs {n_cameras} poses"
+    )
+
+    # LLFF pose convention  (same as Neural3D_NDC_Dataset / 4DGS)
+    poses = np.concatenate(
+        [poses[..., 1:2], -poses[..., :1], poses[..., 2:4]], -1
+    )
+    bottoms = np.array([0, 0, 0, 1]).reshape(
+        1, -1, 4).repeat(n_cameras, axis=0)
+    poses = np.concatenate([poses, bottoms], axis=1)
+    poses = poses @ np.diag([1, -1, -1, 1])
+
+    # Train / test split by camera index
+    i_test = set(int(x) for x in hold_id)
+    if split == 'train':
+        video_list = [i for i in range(n_cameras) if i not in i_test]
+    else:
+        video_list = sorted(i_test)
+
+    # Detect actual image resolution from the first available image to
+    # correctly scale focal length (poses_bounds stores raw resolution).
+    first_image_dir = os.path.join(video_paths[0], 'images')
+    if not os.path.isdir(first_image_dir):
+        first_image_dir = video_paths[0]
+    first_img_name = sorted(os.listdir(first_image_dir))[0]
+    actual_w, actual_h = imagesize.get(
+        os.path.join(first_image_dir, first_img_name))
+    focal = focal_raw * (actual_w / W_raw)
+
+    FovX = focal2fov(focal, actual_w)
+    FovY = focal2fov(focal, actual_h)
+
+    for i in video_list:
+        video_path = video_paths[i]
+        image_dir = os.path.join(video_path, 'images')
+        if not os.path.isdir(image_dir):
+            image_dir = video_path
+        images_names = sorted(os.listdir(image_dir))
+        n_frames = min(num_images, len(images_names))
+
+        c2w = poses[i]
+        matrix = np.linalg.inv(np.array(c2w))
+        R = np.transpose(matrix[:3, :3])
+        T = matrix[:3, 3]
+
+        for idx, img_name in enumerate(images_names[:n_frames]):
+            image_path = os.path.join(image_dir, img_name)
+            timestamp = idx / max(n_frames - 1, 1)
+
+            if not dataloader:
+                image = Image.open(image_path)
+                w, h = image.size
+            else:
+                image = np.empty(0)
+                w, h = actual_w, actual_h
+
+            cam_info = CameraInfo(
+                uid=len(cam_infos),
+                R=R, T=T,
+                FovY=FovY, FovX=FovX,
+                image=image, depth=None,
+                image_path=image_path,
+                image_name=Path(img_name).stem,
+                width=w, height=h,
+                timestamp=timestamp,
+            )
+            cam_infos.append(cam_info)
+
+    print(f"  -> {len(cam_infos)} cameras ({split}), "
+          f"{n_frames} frames/cam, resolution {actual_w}x{actual_h}")
+    return cam_infos
+
+
+def readDynerfSceneInfo(
+    path: str,
+    white_background: bool,
+    eval: bool,
+    num_images: int = 300,
+    hold_id: list = None,
+    dataloader: bool = False,
+) -> SceneInfo:
+    """Top-level N3V/Dynerf scene reader using poses_bounds.npy.
+
+    Args:
+        path: Root dataset directory.
+        white_background: Whether to use white background for alpha compositing.
+        eval: If True, hold out cameras in *hold_id* for testing.
+        num_images: Number of temporal frames per camera (default 300).
+        hold_id: Camera indices reserved for testing (default ``[0]``).
+        dataloader: If True, skip eager image loading (meta_only mode).
+    """
+    if hold_id is None:
+        hold_id = [0]
+
+    print("Reading Training Cameras (dynerf / poses_bounds.npy)")
+    train_cam_infos = readCamerasFromDynerf(
+        path, 'poses_bounds.npy', split='train',
+        hold_id=hold_id, num_images=num_images,
+        dataloader=dataloader,
+    )
+
+    test_cam_infos: list = []
+    if eval:
+        print("Reading Testing Cameras (dynerf / poses_bounds.npy)")
+        test_cam_infos = readCamerasFromDynerf(
+            path, 'poses_bounds.npy', split='test',
+            hold_id=hold_id, num_images=num_images,
+            dataloader=dataloader,
+        )
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    # Prefer pre-processed SfM point cloud; fall back to random
+    ply_path = os.path.join(path, "points3D_downsample2.ply")
+    if not os.path.exists(ply_path):
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(
+            points=xyz, colors=SH2RGB(shs),
+            normals=np.zeros((num_pts, 3)),
+        )
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    else:
+        print(f"Using preprocessed point cloud at {ply_path}")
+
+    try:
+        pcd = fetchPly(ply_path)
+    except Exception:
+        pcd = None
+
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_path,
+    )
+    return scene_info
+
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "dynerf": readDynerfSceneInfo,
 }
